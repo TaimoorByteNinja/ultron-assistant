@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ULTRON</title>
+<style>
+  :root { --accent: #ff8a2a; --accent2: #ffd24a; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #000; overflow: hidden; color: #ffcf9e;
+    font-family: "Segoe UI", system-ui, sans-serif; }
+  #scene { position: fixed; inset: 0; display: block; }
+
+  /* Camera stays alive for hand tracking, but hidden off-screen. */
+  #cam { position: fixed; left: -10000px; top: 0; width: 160px; height: 120px; }
+  #camlabel { display: none; }
+
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+    padding: 20px 26px 22px; text-align: center;
+    background: linear-gradient(to top, rgba(0,0,0,.8), rgba(0,0,0,0)); }
+  #state { display: none; }
+  #state-unused { font-size: 13px; letter-spacing: .32em; text-transform: uppercase;
+    color: rgba(255,190,130,.85); }
+  #state .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:#555; margin-right:9px; vertical-align: middle; transition: all .3s; }
+  #state.live .dot { background: var(--accent); box-shadow: 0 0 12px var(--accent);
+    animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  #heard { margin-top: 10px; font-size: 22px; min-height: 28px; color: #fff;
+    font-weight: 300; text-shadow: 0 0 18px rgba(255,140,40,.5); }
+  #reply { margin-top: 6px; font-size: 16px; min-height: 20px; color: var(--accent2);
+    opacity: .95; font-style: italic; }
+  #sayrow { margin-top: 14px; }
+  #say { width: min(560px, 80vw); padding: 11px 18px; border-radius: 30px;
+    border: 1px solid rgba(255,150,60,.4); background: rgba(30,15,5,.6); color: #ffe;
+    font-size: 15px; outline: none; text-align: center; letter-spacing:.02em; }
+  #say:focus { border-color: var(--accent); box-shadow: 0 0 22px rgba(255,120,30,.35); }
+  #say::placeholder { color: rgba(255,200,150,.4); }
+  #hint { display: none; }
+
+  #start { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: radial-gradient(circle at center, #180c03, #000 70%); cursor: pointer; }
+  #start h1 { font-size: 64px; font-weight: 200; letter-spacing: .5em; color: var(--accent);
+    text-shadow: 0 0 40px rgba(255,120,20,.7); margin-left:.5em; }
+  #start p { margin-top: 22px; font-size: 15px; letter-spacing:.2em; color: rgba(255,200,150,.7);
+    text-transform: uppercase; }
+  #start .go { margin-top: 40px; padding: 15px 46px; border: 1px solid var(--accent);
+    border-radius: 40px; color: var(--accent2); font-size: 15px; letter-spacing:.25em;
+    text-transform: uppercase; transition: all .25s; }
+  #start .go:hover { background: var(--accent); color:#000; box-shadow: 0 0 40px rgba(255,120,20,.6); }
+  #start small { position:absolute; bottom: 26px; font-size: 12px; color: rgba(255,200,150,.35);
+    letter-spacing:.08em; text-align:center; line-height:1.6; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <video id="cam" autoplay playsinline muted></video>
+  <div id="camlabel">hand · offline</div>
+
+  <div id="hud">
+    <div id="state"><span class="dot"></span><span id="statetext">standby</span></div>
+    <div id="heard"></div>
+    <div id="reply"></div>
+    <div id="sayrow">
+      <input id="say" type="text" placeholder="…or type a command and press Enter" autocomplete="off">
+    </div>
+    <div id="hint">Try: “hello” · “what time is it” · “tell me a joke” · “what is 12 times 8” · “search for cats” · move your hand</div>
+  </div>
+
+  <div id="start">
+    <h1>ULTRON</h1>
+    <p>Personal Assistant</p>
+    <div class="go">Activate</div>
+    <small>Click to grant camera &amp; microphone access.<br>Best in Google Chrome. Press F11 for full-screen.</small>
+  </div>
+
+<script type="module">
+/* Hand-tracking (MediaPipe) loads dynamically so a CDN hiccup never kills the app. */
+
+/* ============================================================= VISUALS */
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d');
+let W, H, CX, CY;
+function resize(){ W = canvas.width = innerWidth; H = canvas.height = innerHeight; CX = W/2; CY = H*0.47; }
+addEventListener('resize', resize); resize();
+
+// --- pre-rendered glow sprite (cheap bloom via additive drawImage) ---
+const glow = document.createElement('canvas'); glow.width = glow.height = 64;
+(() => {
+  const g = glow.getContext('2d');
+  const rg = g.createRadialGradient(32,32,0, 32,32,32);
+  rg.addColorStop(0,   'rgba(255,224,170,0.95)');   // warm cream, NOT pure white
+  rg.addColorStop(0.28,'rgba(255,168,74,0.70)');
+  rg.addColorStop(0.6, 'rgba(255,96,26,0.28)');
+  rg.addColorStop(1,   'rgba(255,60,0,0)');
+  g.fillStyle = rg; g.fillRect(0,0,64,64);
+})();
+
+// --- particle sphere (fibonacci) ---
+const N = 2400, pts = [];
+for (let i=0;i<N;i++){
+  const y = 1 - (i/(N-1))*2, r = Math.sqrt(1-y*y);
+  const phi = i * Math.PI * (3 - Math.sqrt(5));
+  // ~55% of points sit on the outer shell; the rest fill the interior => volumetric,
+  // so looking closer reveals more particles packed inside the sphere.
+  const rr = (Math.random()<0.55) ? (0.9+Math.random()*0.1) : (0.2+Math.random()*0.65);
+  pts.push({ x: Math.cos(phi)*r, y, z: Math.sin(phi)*r, rr,
+             tw: Math.random()*6.283, sp: 0.5+Math.random()*1.3 });
+}
+// Precompute a nearest-neighbour network among the OUTER-SHELL particles => a rotating
+// 3D wireframe (the "hacking hologram" look). Interior particles stay as free points.
+const edges = [];
+(() => {
+  const shell = [];
+  for (let i=0;i<N;i++) if (pts[i].rr >= 0.9) shell.push(i);
+  const K = 3;
+  for (let a=0;a<shell.length;a++){
+    const i = shell[a], A = pts[i], best = [];
+    for (let b=0;b<shell.length;b++){
+      if (b===a) continue;
+      const B = pts[shell[b]];
+      const d = A.x*B.x + A.y*B.y + A.z*B.z;   // cosine similarity: higher = closer on the sphere
+      if (best.length < K){ best.push({j:shell[b], d}); best.sort((p,q)=>p.d-q.d); }
+      else if (d > best[0].d){ best[0]={j:shell[b], d}; best.sort((p,q)=>p.d-q.d); }
+    }
+    for (const bb of best) if (i < bb.j) edges.push(i, bb.j);
+  }
+})();
+const stars = Array.from({length:240}, () => ({
+  x: Math.random(), y: Math.random(), s: Math.random()*1.6+0.2, t: Math.random()*6.28 }));
+const rings = [
+  { tilt: 0.5,  yaw: 0.0, sp: 0.6 },
+  { tilt: -0.6, yaw: 1.1, sp: -0.5 },
+  { tilt: 0.1,  yaw: 2.2, sp: 0.4 },
+];
+// floating embers (few, subtle)
+const embers = Array.from({length:20}, () => spawnEmber(true));
+function spawnEmber(init){
+  return { a: Math.random()*6.28, r: 0.3+Math.random()*0.5, life: init?Math.random():0,
+           spd: 0.3+Math.random()*0.6, sway: Math.random()*6.28, size: 0.5+Math.random()*1.1 };
+}
+
+let energy = 0, energyTarget = 0.15;   // 0..1 baseline (hand + speaking)
+let audioLevel = 0;                     // 0..1 live mic amplitude
+let handX = 0, handY = 0, handSeen = false;
+let t = 0, CX_d, CY_d;
+const sparks = [];          // particles released by hand movement
+let phx = 0, phy = 0;       // previous hand position (for velocity)
+let zoom = 1, zoomTarget = 1, handOpen = 0;   // hand comes closer -> zoom inside the cloud
+let rotYaw = 0, rotPitch = 0;                 // hand-driven orbit (rotate like space)
+let speaking = false, micMuted = false;       // speaking + mute-mic-while-it-talks flags
+
+function rot(p, ax, ay){
+  let x = p.x*Math.cos(ay) - p.z*Math.sin(ay);
+  let z = p.x*Math.sin(ay) + p.z*Math.cos(ay);
+  let y = p.y*Math.cos(ax) - z*Math.sin(ax);
+  z = p.y*Math.sin(ax) + z*Math.cos(ax);
+  return { x, y, z };
+}
+
+const buf = new Array(N);
+const RINGS = [
+  { tilt: 0.55, yaw: 0.0, sp: 0.5,  rx: 1.5, rz: 0.5 },
+  { tilt: -0.5, yaw: 1.2, sp: -0.4, rx: 1.5, rz: 0.5 },
+];
+// Draw a ring's requested half: half<0 = the arc behind the sphere (dim), half>0 = in front (bright).
+function drawRings(cx, cy, R, ax, ay, E, half){
+  for (const rd of RINGS){
+    for (let a=0; a<130; a++){
+      const th = a/130*6.283;
+      let p = rot({ x: Math.cos(th)*rd.rx, y: 0, z: Math.sin(th)*rd.rz }, rd.tilt, rd.yaw + t*rd.sp*0.35);
+      p = rot(p, ax*0.5, ay*0.6);
+      if (half < 0 ? p.z >= 0 : p.z < 0) continue;
+      const persp = 1/(1.9 - p.z*0.7);
+      const sx = cx + p.x*R*persp, sy = cy + p.y*R*persp;
+      const df = (p.z+1)/2;
+      const al = (half > 0 ? 0.22 + 0.5*df : 0.10) * (0.6 + 0.5*E);
+      const sz = 0.8 + 1.3*df;
+      ctx.globalAlpha = Math.min(0.9, al);
+      ctx.drawImage(glow, sx-sz, sy-sz, sz*2, sz*2);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(){
+  t += 0.016;
+  energy += (energyTarget - energy) * 0.08;
+  const E = Math.min(1.0, energy + audioLevel*0.5);
+
+  const targetX = CX + (handSeen ? handX * W*0.05 : 0);   // small drift; hand mainly rotates now
+  const targetY = CY + (handSeen ? handY * H*0.05 : 0);
+  CX_d = (CX_d ?? CX) + (targetX - (CX_d ?? CX)) * 0.06;
+  CY_d = (CY_d ?? CY) + (targetY - (CY_d ?? CY)) * 0.06;
+
+  // clear with a light trail (smooth, still crisp — no smear)
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0,0,W,H);
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  // stars
+  for (const s of stars){
+    const a = 0.2 + 0.4*Math.abs(Math.sin(t*s.s*0.6 + s.t));
+    ctx.fillStyle = `rgba(255,205,150,${a*0.32})`;
+    ctx.fillRect(s.x*W, s.y*H, s.s, s.s);
+  }
+
+  if (speaking) audioLevel = Math.max(audioLevel, 0.35 + 0.35*Math.abs(Math.sin(t*11)));  // move with the voice
+
+  // hand drives ZOOM (fly into the cloud) and ROTATION (orbit like space)
+  zoomTarget = handSeen ? (0.85 + handOpen*1.5) : 1;    // open hand -> deep inside
+  zoom += (zoomTarget - zoom) * 0.06;
+  const yawT   = handSeen ? handX * 2.2 : 0;
+  const pitchT = handSeen ? handY * 1.3 : 0;
+  rotYaw   += (yawT   - rotYaw)   * 0.05;
+  rotPitch += (pitchT - rotPitch) * 0.05;
+
+  const pulse = 1 + 0.035*Math.sin(t*2.2) + audioLevel*0.07;
+  const R = Math.min(W,H) * (0.34 + 0.05*E) * pulse * zoom;   // big orb + deep hand zoom
+  const ay = t*(0.18 + 0.35*E) + rotYaw;                // auto-drift + hand orbit
+  const ax = 0.42 + 0.14*Math.sin(t*0.25) + rotPitch;
+  const Lx = 0.35, Ly = -0.45, Lz = 0.82;               // light direction (3D shading)
+
+  // soft warm inner glow (amber core, not a white ball)
+  const cg = ctx.createRadialGradient(CX_d,CY_d,0, CX_d,CY_d, R*1.1);
+  cg.addColorStop(0,   `rgba(255,175,88,${0.26+0.12*E})`);
+  cg.addColorStop(0.5, `rgba(255,104,36,${0.12+0.07*E})`);
+  cg.addColorStop(1,   'rgba(120,40,0,0)');
+  ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(CX_d,CY_d,R*1.1,0,7); ctx.fill();
+
+  drawRings(CX_d, CY_d, R, ax, ay, E, -1);   // ring arcs behind the sphere
+
+  // project every particle (kept indexed so the network edges can reference them)
+  for (let i=0;i<N;i++){
+    const p = pts[i];
+    const rp = rot(p, ax, ay);                             // rotated unit direction (for lighting)
+    const rr = p.rr * (1 + 0.05*Math.sin(t*2.5 + p.tw*3) + audioLevel*0.30*Math.sin(t*9 + p.tw*5));
+    const pz = rp.z*rr;                                    // depth of the actual 3D point
+    const persp = 1/(1.9 - pz*0.7);
+    const df = (pz+1)/2;                                   // 0 = far side, 1 = near side
+    const lightDot = Math.max(0, rp.x*Lx + rp.y*Ly + rp.z*Lz);
+    const shade = 0.16 + 0.84*lightDot;
+    const tw = 0.82 + 0.18*Math.sin(t*2*p.sp + p.tw);
+    const q = buf[i] || (buf[i] = {});                     // reuse objects (no per-frame GC)
+    q.sx = CX_d + rp.x*rr*R*persp;
+    q.sy = CY_d + rp.y*rr*R*persp;
+    q.z = pz; q.df = df;
+    q.size = (0.7 + 1.7*df) * persp * (0.85 + 0.35*E);
+    q.a = Math.min(0.9, shade * (0.20 + 0.8*df) * tw * (0.6 + 0.5*E));
+  }
+
+  // network wireframe between neighbouring shell particles ("hacking" look), 2 batched depth passes
+  ctx.lineWidth = 0.7;
+  ctx.beginPath();
+  for (let e=0;e<edges.length;e+=2){ const A=buf[edges[e]], B=buf[edges[e+1]];
+    if (A.z+B.z >= 0) continue; ctx.moveTo(A.sx,A.sy); ctx.lineTo(B.sx,B.sy); }
+  ctx.strokeStyle = `rgba(255,140,55,${0.045+0.05*E})`; ctx.stroke();   // far edges (dim)
+  ctx.beginPath();
+  for (let e=0;e<edges.length;e+=2){ const A=buf[edges[e]], B=buf[edges[e+1]];
+    if (A.z+B.z < 0) continue; ctx.moveTo(A.sx,A.sy); ctx.lineTo(B.sx,B.sy); }
+  ctx.strokeStyle = `rgba(255,185,95,${0.10+0.14*E})`; ctx.stroke();    // near edges (bright)
+
+  // particles: additive (order-independent, no sort) + a crisp core so each near one is distinct
+  for (let i=0;i<N;i++){
+    const q = buf[i];
+    ctx.globalAlpha = q.a;
+    ctx.drawImage(glow, q.sx-q.size, q.sy-q.size, q.size*2, q.size*2);
+    if (q.df > 0.62){
+      ctx.globalAlpha = Math.min(1, q.a*1.6);
+      ctx.fillStyle = 'rgba(255,240,215,0.9)';
+      const d = 0.8 + q.df;
+      ctx.fillRect(q.sx-d*0.5, q.sy-d*0.5, d, d);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  drawRings(CX_d, CY_d, R, ax, ay, E, +1);   // ring arcs in front of the sphere (bright)
+
+  // tight, dim bloom halo (never washes to white)
+  const bg = ctx.createRadialGradient(CX_d,CY_d,R*0.7, CX_d,CY_d,R*1.85);
+  bg.addColorStop(0, `rgba(255,120,44,${0.09+0.05*E})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = bg; ctx.beginPath(); ctx.arc(CX_d,CY_d,R*1.85,0,7); ctx.fill();
+
+  // embers (few, subtle, close to the orb)
+  for (const e of embers){
+    e.life += 0.006*e.spd; e.sway += 0.028;
+    if (e.life >= 1){ Object.assign(e, spawnEmber(false)); continue; }
+    const rise = e.life;
+    const ex = CX_d + Math.cos(e.a)*R*0.55 + Math.sin(e.sway)*16*rise;
+    const ey = CY_d - rise*Math.min(W,H)*0.26;
+    const al = Math.sin(e.life*Math.PI)*0.5;
+    const sz = e.size*(1.2+1.4*rise);
+    ctx.globalAlpha = al; ctx.drawImage(glow, ex-sz, ey-sz, sz*2, sz*2);
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- sparks released by MOVING YOUR HAND ----
+  if (handSeen){
+    const vx = handX - phx, vy = handY - phy;
+    const speed = Math.hypot(vx, vy);
+    if (speed > 0.006){                                  // hand is moving
+      const n = Math.min(16, Math.floor(speed*140));
+      const dir = Math.atan2(vy, vx);
+      for (let k=0;k<n;k++){
+        const ang = dir + (Math.random()-0.5)*1.1;       // spray toward motion
+        const spd = (1.6 + Math.random()*4.5) * (0.7 + speed*7);
+        const ea = Math.random()*6.283, off = R*(0.2+Math.random()*0.6);
+        sparks.push({ x: CX_d+Math.cos(ea)*off*0.4, y: CY_d+Math.sin(ea)*off*0.4,
+                      vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd,
+                      life: 1, size: 1+Math.random()*2.4 });
+      }
+      energyTarget = Math.min(1, 0.55 + speed*9);         // moving hand energises the orb
+    }
+  }
+  phx = handX; phy = handY;
+  if (sparks.length > 420) sparks.splice(0, sparks.length-420);
+  for (let i=sparks.length-1;i>=0;i--){
+    const sp = sparks[i];
+    sp.x += sp.vx; sp.y += sp.vy; sp.vx *= 0.95; sp.vy *= 0.95; sp.vy += 0.015;
+    sp.life -= 0.02;
+    if (sp.life <= 0){ sparks.splice(i,1); continue; }
+    const sz = sp.size*(0.6+sp.life);
+    ctx.globalAlpha = Math.min(0.95, sp.life);
+    ctx.drawImage(glow, sp.x-sz, sp.y-sz, sz*2, sz*2);
+  }
+  ctx.globalAlpha = 1;
+
+  audioLevel *= 0.9;
+  requestAnimationFrame(draw);
+}
+draw();
+
+/* ============================================================= UI */
+const stateEl=document.getElementById('state'), stateText=document.getElementById('statetext');
+const heardEl=document.getElementById('heard'), replyEl=document.getElementById('reply');
+const camLabel=document.getElementById('camlabel'), sayInput=document.getElementById('say');
+function setState(txt, live){ stateText.textContent=txt; stateEl.classList.toggle('live',!!live); }
+const pick = a => a[Math.floor(Math.random()*a.length)];
+
+/* ============================================================= VOICE OUT */
+let voice=null;
+function pickVoice(){
+  const vs=speechSynthesis.getVoices();
+  const robotic=/robot|zarvox|cellos|trinoids|male|david|daniel|fred|alex|rishi|google uk english male|microsoft (david|mark|george|guy)/i;
+  voice = vs.find(v=>/en/i.test(v.lang) && robotic.test(v.name))   // deep/robotic male voice
+        || vs.find(v=>/en/i.test(v.lang))                          // any English (low pitch makes it robotic)
+        || vs[0];
+}
+speechSynthesis.onvoiceschanged=pickVoice; pickVoice();
+speaking=false;   // (already declared above)
+function speak(text){
+  replyEl.textContent=text;
+  const u=new SpeechSynthesisUtterance(text);
+  if(voice) u.voice=voice; u.rate=0.82; u.pitch=0.4;   // low + slow = heavy & robotic
+  u.onstart=()=>{ speaking=true; energyTarget=0.95; micMuted=true; };     // ignore its own voice
+  u.onend  =()=>{ speaking=false; energyTarget=handSeen?0.55:0.2; setTimeout(()=>{micMuted=false;},500); };
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+
+/* ============================================================= BRAIN */
+const JOKES=[
+  "Why did the computer get cold? It left its Windows open.",
+  "I told my laptop a joke. It had no reaction — no sense of humour.",
+  "Why was the robot angry? Someone kept pushing its buttons.",
+  "There are only 10 kinds of people: those who understand binary and those who do not.",
+];
+const SITES={ youtube:{n:"YouTube",u:"https://youtube.com"}, google:{n:"Google",u:"https://google.com"},
+  gmail:{n:"Gmail",u:"https://mail.google.com"}, github:{n:"GitHub",u:"https://github.com"},
+  whatsapp:{n:"WhatsApp",u:"https://web.whatsapp.com"}, maps:{n:"Maps",u:"https://maps.google.com"},
+  instagram:{n:"Instagram",u:"https://instagram.com"}, chatgpt:{n:"ChatGPT",u:"https://chat.openai.com"} };
+
+const WORDNUM={zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,
+  eleven:11,twelve:12,twenty:20,thirty:30,forty:40,fifty:50,hundred:100};
+function tryMath(s){
+  s = s.replace(/what('?s| is)|calculate|equals?|the answer to/g,'').trim();
+  s = s.replace(/\bplus\b/g,'+').replace(/\b(minus|take away)\b/g,'-')
+       .replace(/\b(times|multiplied by|x)\b/g,'*').replace(/\b(divided by|over)\b/g,'/');
+  for(const [w,n] of Object.entries(WORDNUM)) s=s.replace(new RegExp('\\b'+w+'\\b','g'), n);
+  const m = s.match(/-?\d+(\.\d+)?\s*[-+*/]\s*-?\d+(\.\d+)?/);
+  if(!m) return null;
+  try{
+    const expr=m[0];
+    if(!/^[\d\s.+\-*/]+$/.test(expr)) return null;
+    const v=Function('"use strict";return('+expr+')')();
+    if(typeof v==='number' && isFinite(v)) return Math.round(v*1000)/1000;
+  }catch(_){}
+  return null;
+}
+
+// Chrome built-in on-device AI (Gemini Nano), when available — free, no key.
+let aiSession=null, aiReady=false;
+async function initAI(){
+  try{
+    if('LanguageModel' in self){
+      const av=await self.LanguageModel.availability();
+      if(av==='available'){ aiSession=await self.LanguageModel.create({initialPrompts:[
+        {role:'system',content:'You are Ultron, a concise, friendly voice assistant. Answer in 1-3 short sentences.'}]}); aiReady=true; }
+    } else if(self.ai?.languageModel){
+      aiSession=await self.ai.languageModel.create(); aiReady=true;
+    }
+  }catch(_){}
+}
+async function askAI(prompt){
+  try{ if(aiReady && aiSession) return (await aiSession.prompt(prompt)).trim(); }catch(_){}
+  return null;
+}
+
+function openTab(url){ const w=window.open(url,'_blank'); return !!w; }
+
+async function handleCommand(raw){
+  const s=(raw||'').toLowerCase().trim();
+  if(!s) return;
+  heardEl.textContent=raw; energyTarget=0.85;
+
+  if(/\b(hello|hi+|hey|yo|hola|good (morning|afternoon|evening))\b/.test(s))
+    return speak(pick(["Hello. I am Ultron. How can I help?","Hi there. Ultron at your service.","Hey. What can I do for you?"]));
+  if(/\b(how are you|how'?s it going|how are u|you okay)\b/.test(s))
+    return speak("Running at full power. How can I help you?");
+  if(/\b(your name|who are you|what are you)\b/.test(s))
+    return speak("I am Ultron, your personal assistant.");
+  if(/\bpidu\b/.test(s) || /\bmy (love|girlfriend|gf|crush|valentine|baby|babe)\b/.test(s)
+     || /\bwho do i love\b/.test(s) || /\bwho is my love\b/.test(s))
+    return speak(pick([
+      "Your one true love is Pidu. You love her more than anything in the world.",
+      "That is easy. Your true love is Pidu, and you love her the most.",
+      "Pidu, of course. She is your love, and you adore her the most."]));
+  if(/\b(what can you do|what do you do|help me|your commands|abilities)\b/.test(s))
+    return speak("I can tell the time and date, do quick maths, tell jokes, open websites, search the web, answer questions, and control your phone once it is set up.");
+  if(/\b(thank|thanks|cheers)\b/.test(s)) return speak(pick(["Always at your service.","You are welcome.","Anytime."]));
+  if(/\b(time)\b/.test(s)) return speak("It is "+new Date().toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+".");
+  if(/\b(date|what day|today'?s date)\b/.test(s)) return speak("Today is "+new Date().toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'})+".");
+  if(/\b(joke|make me laugh|funny)\b/.test(s)) return speak(pick(JOKES));
+  if(/\b(bye|goodbye|see you|go idle|shut down)\b/.test(s)) return speak("Goodbye. Ultron going idle.");
+
+  const m=tryMath(s); if(m!==null) return speak("That is "+m+".");
+
+  // phone: how many devices connected
+  if((/how many/.test(s) && /(device|phone|mobile)/.test(s)) || /devices? connected/.test(s)){
+    try{ const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:s})});
+      return speak((await r.json()).message); }
+    catch(_){ return speak("I could not reach the phone service."); }
+  }
+  // phone: search / play on YouTube
+  if(/\byoutube\b/.test(s) && /\b(search|play|find|look up)\b/.test(s)){
+    try{ const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:s})});
+      return speak((await r.json()).message); }
+    catch(_){ return speak("I could not reach the phone service."); }
+  }
+
+  // explicit web search -> browser
+  if(/\b(search|look up)\b/.test(s)){
+    const q=s.replace(/.*\b(search for|search|look up)\b\s*/,'').replace(/\bon (the )?(google|web|internet)\b/g,'').trim();
+    if(q){ const ok=openTab('https://www.google.com/search?q='+encodeURIComponent(q));
+      return speak(ok?("Searching the web for "+q+"."):("Allow pop-ups so I can search for "+q+".")); }
+  }
+
+  // OPEN / LAUNCH something -> PHONE FIRST; browser only if asked, or if no phone.
+  if(/\b(open|launch|start|go to|play|show)\b/.test(s)){
+    const wantsPC=/\b(website|web version|in (the )?(chrome|browser)|on (the )?(pc|computer|laptop|browser))\b/.test(s);
+    let site=null; for(const [k,v] of Object.entries(SITES)) if(s.includes(k)){ site=v; break; }
+    if(wantsPC){
+      if(site){ const ok=openTab(site.u); return speak(ok?("Opening "+site.n+" on the computer."):("Allow pop-ups to open "+site.n+".")); }
+    } else {
+      try{
+        const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:s})});
+        const j=await r.json();
+        if(j.ok) return speak(j.message);                        // opened on the phone
+        if(site){ const ok=openTab(site.u);                      // phone unavailable -> browser fallback
+          if(ok) return speak((/(no phone|not connected)/i.test(j.message)
+            ? "Your phone is not connected, so I opened " : "Could not do that on the phone, so I opened ")+site.n+" on the computer."); }
+        return speak(j.message);
+      }catch(_){
+        if(site){ const ok=openTab(site.u); return speak(ok?("Opening "+site.n+" on the computer."):"Allow pop-ups."); }
+        return speak("I could not reach the phone service.");
+      }
+    }
+  }
+
+  // real answer from on-device AI, if the browser has it
+  const ans=await askAI(raw);
+  if(ans) return speak(ans);
+
+  // Not understood -> stay SILENT (only speak when there's a real answer).
+  return;
+}
+
+/* ============================================================= VOICE IN */
+let recog=null, started=false;
+function startListening(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){ setState("no speech — use Chrome",false); return; }
+  recog=new SR(); recog.lang='en-US'; recog.continuous=true; recog.interimResults=true;
+  recog.onresult=(e)=>{
+    if(micMuted) return;                       // ignore its own voice (while + just after it speaks)
+    let interim='',final='';
+    for(let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i];
+      if(r.isFinal) final+=r[0].transcript; else interim+=r[0].transcript; }
+    if(interim) heardEl.textContent=interim;
+    if(final && final.trim().length>=2) handleCommand(final);   // ignore stray noise
+  };
+  recog.onend=()=>{ if(started){ try{recog.start();}catch(_){} } };   // ALWAYS keep listening
+  recog.onerror=(e)=>{ if(e.error!=='no-speech' && e.error!=='aborted') setState("mic: "+e.error,false); };
+  try{ recog.start(); setState("listening",true); }catch(_){}
+}
+
+/* ============================================================= AUDIO REACTIVITY */
+async function startAudioMeter(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const ac=new (window.AudioContext||window.webkitAudioContext)();
+    const src=ac.createMediaStreamSource(stream);
+    const an=ac.createAnalyser(); an.fftSize=256; src.connect(an);
+    const buf=new Uint8Array(an.frequencyBinCount);
+    (function meter(){
+      an.getByteTimeDomainData(buf);
+      let sum=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; sum+=v*v; }
+      const rms=Math.sqrt(sum/buf.length);
+      audioLevel=Math.max(audioLevel, Math.min(1, rms*3.2));
+      requestAnimationFrame(meter);
+    })();
+  }catch(_){ /* mic meter optional */ }
+}
+
+/* ============================================================= HANDS */
+const video=document.getElementById('cam');
+let handLandmarker=null, lastVideoTime=-1;
+async function startHands(){
+  try{
+    const { HandLandmarker, FilesetResolver }=
+      await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
+    const fileset=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    handLandmarker=await HandLandmarker.createFromOptions(fileset,{
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" },
+      runningMode:"VIDEO", numHands:1 });
+    const stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+    video.srcObject=stream; await video.play(); loopHands();
+  }catch(e){ camLabel.textContent="hand · camera off"; console.warn("hands:",e); }
+}
+function loopHands(){
+  if(handLandmarker && video.readyState>=2 && video.currentTime!==lastVideoTime){
+    lastVideoTime=video.currentTime;
+    const res=handLandmarker.detectForVideo(video, performance.now());
+    if(res.landmarks && res.landmarks.length){
+      const lm=res.landmarks[0], palm=lm[9];
+      handX=(0.5-palm.x)*2; handY=(palm.y-0.5)*2;
+      const dx=lm[12].x-lm[0].x, dy=lm[12].y-lm[0].y;
+      const open=Math.min(1, Math.hypot(dx,dy)*2.2);
+      handSeen=true; handOpen=open; camLabel.textContent="hand · locked";
+      if(!speaking) energyTarget=0.35+open*0.6;
+    } else { handSeen=false; camLabel.textContent="hand · searching"; if(!speaking) energyTarget=0.2; }
+  }
+  requestAnimationFrame(loopHands);
+}
+
+/* ============================================================= BOOT */
+sayInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ const v=sayInput.value; sayInput.value=''; handleCommand(v); }});
+document.getElementById('start').addEventListener('click', async ()=>{
+  if(started) return; started=true;
+  try{ await document.documentElement.requestFullscreen(); }catch(_){}  // go full-screen
+  document.getElementById('start').classList.add('hidden');
+  setState("initializing",true);
+  pickVoice(); speak("Ultron, here for you.");
+  initAI(); startListening(); startAudioMeter(); startHands();
+  setState("listening",true);
+});
+</script>
+</body>
+</html>

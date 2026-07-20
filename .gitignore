@@ -1,0 +1,16 @@
+# Android SDK platform-tools (adb, fastboot, ...) — third-party binaries, install via package manager
+platform-tools/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
